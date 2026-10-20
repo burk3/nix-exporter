@@ -41,11 +41,11 @@ One binary, two subcommands, two systemd units.
 nix-exporter collect   root, no listening sockets
   collectors on independent timers -> merged snapshot
   writes /run/nix-exporter/metrics.prom atomically (write tmp, rename)
-  mode 0640, owner root, group nix-exporter
+  mode 0644 (metrics only; nothing secret), owner root
         |
         | one-way: root never reads anything from serve
         v
-nix-exporter serve     DynamicUser in group nix-exporter, no capabilities
+nix-exporter serve     DynamicUser, no capabilities
   GET /metrics -> file contents + nix_exporter_snapshot_age_seconds
   listens on the configured address (tailscale0 on t11s hosts)
 ```
@@ -71,12 +71,22 @@ families. Each one is isolated: its failure does not affect the others.
 | `slots` | 15s | machines files, `/nix/var/nix/current-load/`, `/proc/locks` |
 | `builders` | 60s | `nix store info --store <uri>` per machine, with timeout |
 | `profiles` | 60s | GC roots list, profile symlinks, `db.sqlite` |
-| `upkeep` | 60s | systemd over D-Bus, journald |
+| `upkeep` | 60s | `systemctl show`, `journalctl` |
 | `liveness` | 1h | `nix-store --gc --print-roots`, `db.sqlite` reachability walk |
 
-Crates: `prometheus-client` (encoding), `rusqlite` (system sqlite, opened
-`SQLITE_OPEN_READ_ONLY`, `busy_timeout` 1s), `procfs`, `zbus`, `tokio`,
-`hyper` or `axum` for `serve`.
+Implementation stays small and synchronous: one OS thread per collector,
+`rusqlite` (bundled SQLite, opened `SQLITE_OPEN_READ_ONLY`, `busy_timeout`
+1s), `tiny_http` for `serve`, `serde_json`, `clap`, `dns-lookup`. `/proc`,
+`/sys/fs/cgroup` and the text exposition format are handled by small
+in-tree modules (each parser unit-tested), and systemd is queried with
+`systemctl show` / `journalctl` subprocesses rather than D-Bus. Base
+intervals scale from `--base-interval` (default 15s; 60s collectors use 4x)
+so the NixOS test can run them every 2s.
+
+All `nix` subprocesses run with `NIX_REMOTE=daemon`: under
+`ProtectSystem=strict` a root `nix-store` could not open the local store
+read-write, and through the daemon `--print-roots` is uncensored for root
+and the stale-link cleanup happens in the daemon.
 
 ## Verified facts this design relies on
 
@@ -87,7 +97,8 @@ Collected on juicy-j and freddie-kane with `research/probe.sh` on 2026-10-19.
   take under 0.3s, including process start-up. Columns used: `ValidPaths(id,
   path, registrationTime, narSize, ultimate, sigs)`, `Refs(referrer,
   reference)`. `ultimate = 1` marks paths built locally.
-- **Active builds**: Nix writes one root-only JSON file per local build to
+- **Active builds** (Determinate Nix only; see Builds for upstream): Nix
+  writes one root-only JSON file per local build to
   `/nix/var/nix/active-builds/<nixPid>-<n>`, e.g.
   `{"type":"build","derivation":"…drv","nixPid":…,"mainPid":…,"mainUser":{"name":"nixbld1","uid":30001},"startTime":…,"clientPid":null,"clientUid":null,"cgroup":null}`.
   Only builds executed locally get an entry; builds offloaded to another
@@ -268,9 +279,14 @@ Origin attribution for each active-builds entry:
    instead of step 1.
 4. Any lookup that fails because a process exited: `origin="unknown"`.
 
-When `active-builds/` does not exist (older Nix), the collector reports
-nothing for this family and `nix_exporter_collector_success{collector="builds"}`
-stays 1.
+When `active-builds/` does not exist, builds are found from processes
+instead: every process with a build UID (see Daemon) whose parent does not
+have a build UID is the top of one build. Its parent is the `nixPid` for
+attribution and its start time is the build's start time. This is the path
+upstream Nix takes: nixpkgs' Nix 2.34.9 and 2.35.3 have no `active-builds/`
+or `nix ps` (checked 2026-10-20); they are Determinate-only. With neither
+`active-builds/` nor a build UID rule (no `build-users-group`, no
+`auto-allocate-uids`) the family is absent and the collector still succeeds.
 
 ### Builder slots (`slots`) and builders (`builders`)
 
@@ -341,16 +357,20 @@ Journal lines are read for the unit's last `InvocationID` only.
 
 - `nix-exporter-collect.service`: `User=root`, `ProtectSystem=strict`,
   `ProtectHome=read-only`, `PrivateTmp=yes`, `NoNewPrivileges=yes`,
-  `RuntimeDirectory=nix-exporter` (the only writable path),
+  `RuntimeDirectory=nix-exporter` and `CacheDirectory=nix-exporter`
+  (`XDG_CACHE_HOME` for `nix`), plus `ReadWritePaths=/nix/var/nix/db`: SQLite
+  readers of a WAL database need to map and lock `db.sqlite-shm`. The
+  exporter only ever opens the DB read-only.
   `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK` (outbound only:
   builder pings, DNS, D-Bus), no listening sockets.
-- `nix-exporter-serve.service`: `DynamicUser=yes`,
-  `SupplementaryGroups=nix-exporter`, `CapabilityBoundingSet=` (empty),
-  `ProtectSystem=strict`, `ProtectHome=yes`, `PrivateTmp=yes`,
-  `PrivateDevices=yes`, `ReadOnlyPaths=/run/nix-exporter`,
-  `RestrictAddressFamilies=AF_INET AF_INET6`.
+- `nix-exporter-serve.service`: `DynamicUser=yes`, `CapabilityBoundingSet=`
+  (empty), `ProtectSystem=strict`, `ProtectHome=yes`, `PrivateTmp=yes`,
+  `PrivateDevices=yes`, `RestrictAddressFamilies=AF_INET AF_INET6`.
+- `hardening = false` drops these sandboxing settings and runs `serve` as
+  `nobody` instead of a `DynamicUser` (both need namespaces that
+  `systemd-nspawn` inside the Nix sandbox does not allow).
 - Label values come from local data, some of it influenced by other users
-  (process titles, PTR records). `prometheus-client` escapes them; no other
+  (process titles, PTR records). The exposition encoder escapes them; no other
   processing is done on them.
 
 ## Packaging
@@ -379,7 +399,9 @@ Module options under `services.nix-exporter`:
 | `extraMachinesFiles` | `[ ]` |
 | `upkeepUnits` | `[ "nix-gc.service" "nix-optimise.service" ]` |
 | `resolvePeers` | `true` |
-| `livenessInterval` | `"1h"` |
+| `baseInterval` | `15` (seconds) |
+| `livenessInterval` | `3600` (seconds) |
+| `nixPackage` | `config.nix.package` on NixOS, `pkgs.nix` elsewhere |
 | `hardening` | `true` (systemd sandboxing on both units; set `false` only where the host cannot apply it, e.g. inside `systemd-nspawn`) |
 
 The port is not registered on the Prometheus default-port wiki; check it is
@@ -408,7 +430,10 @@ juicy-j open the port on `tailscale0`, and VictoriaMetrics on juicy-j gets a
   Two machines, `builder` and `client`; `client` uses `builder` as an ssh-ng
   remote builder. `builder` runs with `auto-allocate-uids = true` and the
   `cgroups` feature, `client` with classic `nixbld` users, so both build user
-  schemes are covered. Checks:
+  schemes are covered. The test machines run nixpkgs' upstream Nix, so the
+  test exercises the process-based build discovery; the `active-builds/`
+  path is covered by unit tests and by running on juicy-j (Determinate).
+  Checks:
   - a local build on `builder` appears as `origin="local"`;
   - while a build runs, `nix_daemon_memory_bytes{role="builds"}` is non-zero
     on both machines (nameless auto-allocated UIDs and `nixbld` users);

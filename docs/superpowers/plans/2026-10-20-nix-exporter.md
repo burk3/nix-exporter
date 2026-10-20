@@ -121,7 +121,8 @@ fn main() {
     nixpkgs.url = "https://flakehub.com/f/NixOS/nixpkgs/0";
     crane.url = "github:ipetkov/crane";
     system-manager = {
-      url = "github:numtide/system-manager";
+      # main requires nixpkgs 26.11; follow the release branch matching nixpkgs
+      url = "github:numtide/system-manager/release-26.05";
       inputs.nixpkgs.follows = "nixpkgs";
     };
   };
@@ -1714,7 +1715,11 @@ impl Attributor<'_> {
             return Origin::unknown();
         };
         if c.is_remote_server() {
-            return Origin::new("remote", self.peer_of(pid).unwrap_or_default());
+            // Without an sshd above it (e.g. Hydra spawning `nix-store --serve`
+            // locally) it is not remote; fall through.
+            if let Some(peer) = self.peer_of(pid) {
+                return Origin::new("remote", peer);
+            }
         }
         let hydra = self
             .procs
@@ -1857,7 +1862,13 @@ use std::path::{Path, PathBuf};
 pub fn dir_of(proc_dir: &Path, cgroup_root: &Path, pid: u32) -> Option<PathBuf> {
     let text = fs::read_to_string(proc_dir.join(pid.to_string()).join("cgroup")).ok()?;
     let rel = text.lines().find_map(|l| l.strip_prefix("0::"))?;
-    Some(cgroup_root.join(rel.trim_start_matches('/')))
+    let dir = cgroup_root.join(rel.trim_start_matches('/'));
+    // With use-cgroups, upstream moves the daemon into `<unit>/nix-daemon`
+    // and builds into sibling `nix-build-*` cgroups; count the whole unit.
+    if dir.file_name().is_some_and(|n| n == "nix-daemon") {
+        return dir.parent().map(Path::to_path_buf);
+    }
+    Some(dir)
 }
 
 fn read(dir: &Path, file: &str) -> Option<String> {
@@ -1968,6 +1979,14 @@ mod tests {
             Some(PathBuf::from("/sys/fs/cgroup/system.slice/nix-daemon.service"))
         );
         assert_eq!(dir_of(&d.path().join("proc"), Path::new("/sys/fs/cgroup"), 101), None);
+        write(
+            &d.path().join("proc/102/cgroup"),
+            "0::/system.slice/nix-daemon.service/nix-daemon\n",
+        );
+        assert_eq!(
+            dir_of(&d.path().join("proc"), Path::new("/sys/fs/cgroup"), 102),
+            Some(PathBuf::from("/sys/fs/cgroup/system.slice/nix-daemon.service"))
+        );
     }
 
     #[test]
@@ -2405,12 +2424,32 @@ impl Graph {
     }
 }
 
-/// `nix-store --gc --print-roots` lines: `<link> -> <store path>`.
+/// `nix-store --gc --print-roots` lines: `<link> -> <store path>`. Nix
+/// prints the link as a quoted C++ path (`"/a/b" -> /nix/store/…`), with `"`
+/// and `\` escaped; `{censored}` and older Nix leave it bare.
 pub fn parse_roots(text: &str) -> Vec<(String, String)> {
     text.lines()
         .filter_map(|l| l.rsplit_once(" -> "))
-        .map(|(link, target)| (link.to_string(), target.to_string()))
+        .map(|(link, target)| (unquote(link), target.to_string()))
         .collect()
+}
+
+fn unquote(s: &str) -> String {
+    let Some(inner) = s.strip_prefix('"').and_then(|s| s.strip_suffix('"')) else {
+        return s.to_string();
+    };
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(next) = chars.next() {
+                out.push(next);
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// The store path containing `p` (`<store_dir>/<name>`), if `p` is in the store.
@@ -2450,18 +2489,6 @@ pub fn root_kind(link: &str, state_dir: &str) -> &'static str {
     } else {
         "auto"
     }
-}
-
-/// `gcroots/auto` links whose target no longer exists. Must run before
-/// `--print-roots`, which deletes them.
-pub fn stale_auto_roots(dir: &Path) -> usize {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return 0;
-    };
-    entries
-        .flatten()
-        .filter(|e| fs::metadata(e.path()).is_err())
-        .count()
 }
 
 #[cfg(test)]
@@ -2522,9 +2549,14 @@ mod tests {
 
     #[test]
     fn parses_roots_and_store_paths() {
-        let roots = parse_roots("/proc/2453/maps -> /nix/store/x-glibc-2.42\n/nix/var/nix/profiles/system-55-link -> /nix/store/y-nixos-system\n{censored} -> /nix/store/z-thing\n");
-        assert_eq!(roots.len(), 3);
+        // Real output: links are quoted (Determinate 2.35.3 and upstream 2.34.8).
+        let roots = parse_roots("\"/proc/2453/maps\" -> /nix/store/x-glibc-2.42\n\"/home/burke/.local/state/nix/profiles/home-manager-8-link\" -> /nix/store/y-home-manager-generation\n{censored} -> /nix/store/z-thing\n\"/tmp/we\\\"ird\\\\dir/result\" -> /nix/store/w-x\n/old/unquoted -> /nix/store/v-y\n");
+        assert_eq!(roots.len(), 5);
         assert_eq!(roots[0], ("/proc/2453/maps".into(), "/nix/store/x-glibc-2.42".into()));
+        assert_eq!(roots[1].0, "/home/burke/.local/state/nix/profiles/home-manager-8-link");
+        assert_eq!(roots[2].0, "{censored}");
+        assert_eq!(roots[3].0, "/tmp/we\"ird\\dir/result");
+        assert_eq!(roots[4].0, "/old/unquoted");
         assert_eq!(
             store_path_of("/nix/store/x-glibc-2.42/lib/libc.so.6", "/nix/store").as_deref(),
             Some("/nix/store/x-glibc-2.42")
@@ -2546,18 +2578,13 @@ mod tests {
     }
 
     #[test]
-    fn temp_and_stale_roots() {
+    fn temp_roots_are_nul_separated() {
         let d = tempfile::tempdir().unwrap();
         write(&d.path().join("temproots/123"), "/nix/store/a-x\0/nix/store/b-y\0");
         let mut t = temp_roots(&d.path().join("temproots"));
         t.sort();
         assert_eq!(t, vec!["/nix/store/a-x", "/nix/store/b-y"]);
-        let auto = d.path().join("auto");
-        std::fs::create_dir_all(&auto).unwrap();
-        std::os::unix::fs::symlink(d.path().join("temproots/123"), auto.join("ok")).unwrap();
-        std::os::unix::fs::symlink(d.path().join("gone"), auto.join("stale")).unwrap();
-        assert_eq!(stale_auto_roots(&auto), 1);
-        assert_eq!(stale_auto_roots(&d.path().join("nope")), 0);
+        assert!(temp_roots(&d.path().join("nope")).is_empty());
     }
 }
 ```
@@ -2869,6 +2896,7 @@ mod liveness;
 mod profiles;
 mod store;
 
+#[allow(unused_imports)] // used by main from Task 13
 pub use liveness::dead_paths;
 
 use crate::collector::Collector;
@@ -2996,13 +3024,11 @@ struct Computed {
     graph: Graph,
     dead: Vec<u32>,
     roots: Vec<(String, String)>,
-    stale: usize,
 }
 
 fn compute(ctx: &Ctx) -> Result<Computed> {
-    // Order matters: stale links before --print-roots deletes them, temp
-    // roots before loading the graph so paths built meanwhile stay alive.
-    let stale = liveness::stale_auto_roots(&ctx.paths.gcroots_auto());
+    // Temp roots are read before loading the graph so paths built
+    // meanwhile stay alive.
     let roots = print_roots()?;
     let store = ctx.paths.store_dir.as_str();
     let mut root_paths: Vec<String> = roots
@@ -3021,7 +3047,6 @@ fn compute(ctx: &Ctx) -> Result<Computed> {
         graph,
         dead,
         roots,
-        stale,
     })
 }
 
@@ -3064,8 +3089,6 @@ impl Collector for Liveness {
             Family::gauge("nix_store_dead_bytes", "NAR size of store paths a GC would delete.")
                 .with(&[], dead_bytes as f64),
             roots,
-            Family::gauge("nix_store_gc_roots_stale", "gcroots/auto links whose target is gone.")
-                .with(&[], c.stale as f64),
         ])
     }
 }
@@ -3485,7 +3508,8 @@ impl Collector for Builds {
             }
             None => {
                 // Upstream Nix: no active-builds/, find builds from processes.
-                let uids = BuildUids::from_config(&ctx.nix_config()?, &users);
+                let cfg = ctx.nix_config()?;
+                let uids = BuildUids::from_config(&cfg, &users);
                 let boot = procs::boot_time(&ctx.paths.proc_dir).unwrap_or(0);
                 for (nix_pid, top) in buildset::builds_from_processes(&procs, &uids) {
                     let start = procs.get(top).map(|p| procs::start_time_seconds(p, boot));
@@ -3588,6 +3612,7 @@ mod liveness;
 mod profiles;
 mod store;
 
+#[allow(unused_imports)] // used by main from Task 13
 pub use liveness::dead_paths;
 
 use crate::collector::Collector;
@@ -3947,6 +3972,7 @@ mod slots;
 mod store;
 mod upkeep;
 
+#[allow(unused_imports)] // used by main from Task 13
 pub use liveness::dead_paths;
 
 use crate::collector::Collector;
@@ -4059,6 +4085,8 @@ mod tests {
     }
 }
 ```
+
+- [ ] **Step 1b: In `src/collectors/mod.rs`, delete the line `#[allow(unused_imports)] // used by main from Task 13`** (main now uses `dead_paths`).
 
 - [ ] **Step 2: Replace `src/main.rs`** (drops `#![allow(dead_code)]`)
 
@@ -4180,7 +4208,7 @@ fn main() -> anyhow::Result<()> {
 Run: `nix develop -c cargo test && nix develop -c cargo clippy --all-targets -- -D warnings`
 Expected: all tests pass, no warnings. If clippy reports dead code, delete the unused item rather than allowing it.
 
-Smoke run on juicy-j without root (most collectors will fail on permissions; that is expected and shows the failure path):
+Smoke run on juicy-j without root (the collectors work unprivileged too, reading less: no `active-builds/` contents, censored runtime roots):
 
 ```bash
 nix develop -c cargo build
@@ -4685,6 +4713,7 @@ pkgs.testers.runNixOSTest (
       for m in (builder, client):
           m.wait_for_unit("nix-exporter-collect.service")
           m.wait_for_unit("nix-exporter-serve.service")
+          m.wait_for_open_port(9944)
           wait_for(m, lambda t: value(t, "nix_store_valid_paths") is not None, "store metrics")
       builder.wait_for_unit("sshd.service")
 
@@ -4720,7 +4749,11 @@ pkgs.testers.runNixOSTest (
 
       with subtest("dead paths match nix-store --print-dead"):
           builder.succeed("nix-exporter print-dead | LC_ALL=C sort > /tmp/ours")
-          builder.succeed("nix-store --gc --print-dead 2>/dev/null | LC_ALL=C sort > /tmp/theirs")
+          # Nix also reports unregistered entries in /nix/store (the test VM's store
+          # overlay shows paths it never registered); print-dead only knows valid ones.
+          builder.succeed("nix-store --gc --print-dead 2>/dev/null | LC_ALL=C sort > /tmp/all")
+          builder.succeed("xargs -r nix-store --check-validity --print-invalid < /tmp/all | LC_ALL=C sort > /tmp/invalid")
+          builder.succeed("LC_ALL=C comm -23 /tmp/all /tmp/invalid > /tmp/theirs")
           builder.succeed("diff -u /tmp/theirs /tmp/ours")
           builder.succeed("test -s /tmp/ours")
           wait_for(builder, lambda t: (value(t, "nix_store_dead_paths") or 0) > 0, "dead path count")
@@ -4731,6 +4764,10 @@ pkgs.testers.runNixOSTest (
           wait_for(builder, lambda t: value(t, 'nix_upkeep_last_deleted_paths{unit="nix-gc.service"}') is not None, "gc deleted paths")
           builder.succeed("systemctl start nix-optimise.service")
           wait_for(builder, lambda t: value(t, 'nix_upkeep_last_freed_bytes{unit="nix-optimise.service"}') is not None, "optimise freed bytes")
+
+      with subtest("profiles and roots"):
+          wait_for(builder, lambda t: (value(t, 'nix_profile_generations{profile="/nix/var/nix/profiles/system"}') or 0) >= 1, "system profile")
+          wait_for(builder, lambda t: (value(t, 'nix_store_gc_roots{kind="profile"}') or 0) >= 1, "profile roots")
 
       with subtest("cgroup counters, collector health, exposition format"):
           cpu_after = value(scrape(builder), cpu)
@@ -4858,6 +4895,8 @@ git commit -m "Add systemd-nspawn container variant of the NixOS test"
 5. **How builds are attributed**: short version of the spec's algorithm; Determinate's `active-builds/` vs. the process fallback on upstream Nix.
 6. **Caveats**:
    - `nix-store --gc --print-roots` (run by the liveness and profiles collectors) deletes stale `gcroots/auto` links, as a GC does.
+   - Machines files entries named `localhost` are treated as local (Hydra's meaning) and get no slot or ping metrics.
+   - `PrivateTmp` on the collector hides the host's `/tmp`: a profile link under `/tmp` is not seen.
    - `ReadWritePaths=/nix/var/nix/db` is needed because SQLite WAL readers map the `-shm` file; the exporter opens the DB read-only.
    - Builder pings run every `4 × baseInterval` and open an ssh connection to each remote builder.
    - The container test variant: passing, or the reason it is not run (from Task 16).

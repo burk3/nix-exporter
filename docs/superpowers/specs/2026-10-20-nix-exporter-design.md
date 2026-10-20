@@ -178,11 +178,13 @@ are never label values.
 | `nix_store_dead_paths` | gauge | valid paths not reachable from any root |
 | `nix_store_dead_bytes` | gauge | their summed `narSize` |
 | `nix_store_gc_roots{kind}` | gauge | `kind` = `runtime`, `profile`, `auto`, `hydra`, `other` |
-| `nix_store_gc_roots_stale` | gauge | `gcroots/auto` links whose target is gone |
 
-Algorithm: first count stale roots with our own `readlink` pass over
-`gcroots/auto` (before `--print-roots` deletes them). Then take root store
-paths from `nix-store --gc --print-roots`, add temp roots from
+There is no stale-root count: `--print-roots`, which the profiles collector
+runs every minute, deletes stale `gcroots/auto` links, so a count would
+almost always read 0.
+
+Algorithm: take root store paths from `nix-store --gc --print-roots` (links are
+printed quoted and are unquoted), add temp roots from
 `/nix/var/nix/temproots/`, load `Refs` into memory, and walk reachability. If
 `keep-derivations` / `keep-outputs` are set, follow derivers and outputs as
 Nix does. Every path not reached is dead.

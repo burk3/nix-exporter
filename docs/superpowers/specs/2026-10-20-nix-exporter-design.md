@@ -99,6 +99,21 @@ Collected on juicy-j and freddie-kane with `research/probe.sh` on 2026-10-19.
   process title to `nix-daemon <client-pid> …`. The client PID was correct for
   every probe: local `nix` as burke, root `nix --store daemon`, and a remote
   ssh-ng client.
+  This is upstream behaviour (`src/nix/unix/daemon.cc`: "For debugging, stuff
+  the pid into argv[1]"): the PID is `strncpy`d over the original `argv[1]`
+  (`--daemon` upstream, `--option` under Determinate), so it is NUL-padded
+  and truncated to that argument's length. A daemon started with no
+  arguments has no title to read.
+- **Build users vary with daemon settings.** With `build-users-group =
+  nixbld` builds run as `nixbld<N>`. With `auto-allocate-uids = true`
+  (juicy-j since 2026-10-20) they run as nameless UIDs from `start-id`
+  (872415232) up to `start-id + id-count`, and active-builds reports
+  `"mainUser":{"name":null,"uid":872415232}`. Builds that require `uid-range`
+  run in a user namespace and get their own cgroup,
+  `<daemon unit cgroup>/nix-build-uid-<uid>`; active-builds then has
+  `"cgroup"` set and `utime`/`stime` filled. No controllers are enabled in the
+  unit's `cgroup.subtree_control`, so those child cgroups have `cpu.stat` but
+  no `memory.*` files. The unit cgroup's own counters include them.
 - **Root without the daemon**: `nix build` as root with the default store
   builds in-process; `nixPid` is the `nix` process itself, not a worker.
 - **Remote ssh-ng builds**: the worker's client is `nix-daemon --stdio`
@@ -189,7 +204,15 @@ not `nix-daemon <pid> …`). Workers are its `nix-daemon` children. The
 | `nix_daemon_start_time_seconds` | gauge | main daemon start time |
 | `nix_daemon_connections` | gauge | worker count |
 | `nix_daemon_remote_sessions{user,client}` | gauge | workers whose client is `nix-daemon --stdio` under sshd |
-| `nix_daemon_memory_bytes{role}` | gauge | RSS; `role` = `daemon` (main + workers) or `builds` (build processes) |
+| `nix_daemon_memory_bytes{role}` | gauge | RSS; `role` = `daemon` (main + workers) or `builds` (build processes, see below) |
+| `nix_daemon_max_jobs` | gauge | the `max-jobs` setting |
+
+Build processes are identified without assuming a build user scheme: every
+process descended from an active build's `mainPid`, plus any process whose
+UID is a build UID (members of `build-users-group` when that is set, or
+`[start-id, start-id + id-count)` when `auto-allocate-uids` is on; both read
+from `nix config show`). The UID rule catches processes that escaped the
+build's process tree and covers daemons without `active-builds/`.
 
 Unit cgroup metrics come from the main daemon's cgroup, found through
 `/proc/<pid>/cgroup` (cgroup v2 only), so they work whatever the unit is
@@ -230,14 +253,17 @@ Origin attribution for each active-builds entry:
    - If its title is `nix-daemon <client-pid> …`, continue with the client.
    - Otherwise `origin="unknown"`, `client=""`.
 2. Classify the client process:
-   - `nix-daemon --stdio`: walk up to the nearest `sshd-session` ancestor,
+   - `nix-daemon --stdio` (ssh-ng) or `nix-store --serve` (legacy `ssh://`
+     builders, e.g. Hydra machines files using `ssh://`): walk up to the nearest `sshd-session` ancestor,
      find its TCP socket inode in `/proc/<pid>/fd`, match it in
      `/proc/net/tcp` and `/proc/net/tcp6`, take the peer address, reverse
      resolve it (cached, falls back to the IP). `origin="remote"`,
      `client=<hostname or IP>`.
    - user is `hydra-queue-runner` (or an ancestor runs as it):
      `origin="hydra"`, `client="hydra"`.
-   - anything else: `origin="local"`, `client=<user name>`.
+   - anything else: `origin="local"`, `client=<user name>`. Build UIDs
+     never appear here: the client is the process that asked for the build,
+     not the build.
 3. If the active-builds entry has a non-null `clientUid`/`clientPid`, use them
    instead of step 1.
 4. Any lookup that fails because a process exited: `origin="unknown"`.
@@ -264,6 +290,8 @@ carries the entry's `ssh-key` and `base64-ssh-public-host-key` as store URI
 parameters. An entry without a host key relies on root's existing
 `known_hosts`; `/root` is read-only to the collector, so a new host key is a
 failed ping, not a prompt. Machines whose URI is `localhost` or `local` are not pinged.
+Slot file names are derived from the URI as Nix does (`/` replaced by `_`),
+so `ssh://` and `ssh-ng://` machines both match.
 
 ### Upkeep (`upkeep`)
 
@@ -352,6 +380,7 @@ Module options under `services.nix-exporter`:
 | `upkeepUnits` | `[ "nix-gc.service" "nix-optimise.service" ]` |
 | `resolvePeers` | `true` |
 | `livenessInterval` | `"1h"` |
+| `hardening` | `true` (systemd sandboxing on both units; set `false` only where the host cannot apply it, e.g. inside `systemd-nspawn`) |
 
 The port is not registered on the Prometheus default-port wiki; check it is
 still unallocated before release.
@@ -367,9 +396,23 @@ juicy-j open the port on `tailscale0`, and VictoriaMetrics on juicy-j gets a
   `/proc/net/tcp`, active-builds JSON, GC and optimise journal lines.
 - **Store tests** against a generated SQLite DB with the real schema:
   aggregates, reachability walk, profile discovery and closure size.
-- **NixOS VM test** (`checks.x86_64-linux.vm`), two nodes, `builder` and
-  `client`, `client` configured with `builder` as an ssh-ng remote builder:
+- **NixOS test**, one definition built two ways:
+  - `checks.x86_64-linux.vm`: QEMU nodes, `hardening = true`. This is the
+    gate; it runs on juicy-j (`kvm`, `nixos-test`) and under Hydra.
+  - `checks.x86_64-linux.container`: the same machines as `systemd-nspawn`
+    containers with `hardening = false`, for fast iteration. Needs the host
+    daemon settings from the NixOS manual (`auto-allocate-uids`, `uid-range`,
+    `cgroups`), which juicy-j has. If Nix builds cannot run inside the test
+    containers, this variant is dropped and the reason recorded in the README.
+
+  Two machines, `builder` and `client`; `client` uses `builder` as an ssh-ng
+  remote builder. `builder` runs with `auto-allocate-uids = true` and the
+  `cgroups` feature, `client` with classic `nixbld` users, so both build user
+  schemes are covered. Checks:
   - a local build on `builder` appears as `origin="local"`;
+  - while a build runs, `nix_daemon_memory_bytes{role="builds"}` is non-zero
+    on both machines (nameless auto-allocated UIDs and `nixbld` users);
+  - a `uid-range` build on `builder` is attributed like any other build;
   - a build from `client` appears on `builder` as `origin="remote"`,
     `client=<client address>`, and on `client` as
     `nix_builds_offloaded{machine=…} 1`;

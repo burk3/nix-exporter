@@ -4877,7 +4877,7 @@ git commit -m "Add README"
 **Files (in `/home/burke/src/all-the-nix`, via a worktree):**
 - Modify: `flake.nix`, `flake.lock`, `systems/x86_64-linux/juicy-j/monitoring.nix`
 
-The main checkout has uncommitted user changes (`modules/nixos/base/default.nix`, `systems/x86_64-linux/juicy-j/default.nix`); do not touch them. Work in a separate worktree.
+The main checkout has an uncommitted, unrelated user change (UPS settings in `systems/x86_64-linux/juicy-j/default.nix`); do not touch it. Work in a separate worktree branched from `HEAD` (which includes the committed `auto-allocate-uids` / `cgroups` settings, commit `05ae865`).
 
 - [ ] **Step 1: Create the worktree and branch**
 
@@ -4947,4 +4947,4 @@ git add -A
 git commit -m "juicy-j: run nix-exporter and scrape it"
 ```
 
-- [ ] **Step 6: Report** the worktree path, branch name, and the command for the user: `sudo nixos-rebuild switch --flake /home/burke/src/all-the-nix-nix-exporter#juicy-j` (or `nh os switch /home/burke/src/all-the-nix-nix-exporter`). Note that the branch does not contain the user's uncommitted `auto-allocate-uids` / `cgroups` settings from the main checkout, so switching to it reverts those until they are committed and merged.
+- [ ] **Step 6: Report** the worktree path, branch name, and the command for the user: `sudo nixos-rebuild switch --flake /home/burke/src/all-the-nix-nix-exporter#juicy-j` (or `nh os switch /home/burke/src/all-the-nix-nix-exporter`). Note that the branch does not contain the uncommitted UPS change from the main checkout, so switching to it reverts that until it is committed.

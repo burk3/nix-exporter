@@ -66,7 +66,7 @@ families. Each one is isolated: its failure does not affect the others.
 | collector | interval | sources |
 |---|---|---|
 | `store` | 15s | `db.sqlite` read-only |
-| `daemon` | 15s | `/proc` |
+| `daemon` | 15s | `/proc`, the daemon unit's cgroup v2 files |
 | `builds` | 15s | `/nix/var/nix/active-builds/`, `/proc`, `/proc/net/tcp{,6}`, reverse DNS |
 | `slots` | 15s | machines files, `/nix/var/nix/current-load/`, `/proc/locks` |
 | `builders` | 60s | `nix store info --store <uri>` per machine, with timeout |
@@ -190,12 +190,30 @@ not `nix-daemon <pid> …`). Workers are its `nix-daemon` children. The
 | `nix_daemon_connections` | gauge | worker count |
 | `nix_daemon_remote_sessions{user,client}` | gauge | workers whose client is `nix-daemon --stdio` under sshd |
 | `nix_daemon_memory_bytes{role}` | gauge | RSS; `role` = `daemon` (main + workers) or `builds` (build processes) |
-| `nix_daemon_cpu_seconds{role}` | gauge | utime + stime of live processes |
 
-`nix_daemon_cpu_seconds` only covers processes alive at sample time, so
-it can go down; it is a gauge rather than a `_total` counter. (Correct
-counter semantics would need cgroups, which `use-cgroups = false` does not
-provide.)
+Unit cgroup metrics come from the main daemon's cgroup, found through
+`/proc/<pid>/cgroup` (cgroup v2 only), so they work whatever the unit is
+called. On juicy-j that is `/sys/fs/cgroup/system.slice/nix-daemon.service`.
+The cgroup holds the daemon, its workers and every build they start (Hydra's
+and remote builds included), and usage of exited processes stays counted, so
+these are true counters. They reset when the daemon restarts. A root
+`nix build` that bypasses the daemon runs outside this cgroup and is not
+counted. This needs only cgroup v2; it does not need `use-cgroups`.
+
+| metric | type | source |
+|---|---|---|
+| `nix_daemon_cgroup_cpu_seconds_total{mode="user"\|"system"}` | counter | `cpu.stat` `user_usec`, `system_usec` |
+| `nix_daemon_cgroup_memory_bytes` | gauge | `memory.current` |
+| `nix_daemon_cgroup_memory_peak_bytes` | gauge | `memory.peak` |
+| `nix_daemon_cgroup_io_bytes_total{direction="read"\|"write"}` | counter | `io.stat` `rbytes`, `wbytes` summed over devices |
+| `nix_daemon_pressure_seconds_total{resource="cpu"\|"memory"\|"io",kind="some"\|"full"}` | counter | `<resource>.pressure` `total=` |
+
+A missing controller file (e.g. memory accounting off) omits that metric only.
+Without cgroup v2 the whole cgroup group is omitted.
+
+Per-build cgroups (`use-cgroups = true`) are not used in v1. Reading them only
+sees builds alive at sample time, and Nix deletes a build's cgroup when the
+build ends, so totals per origin would miss short builds. See phase 2.
 
 ### Builds (`builds`)
 
@@ -356,6 +374,7 @@ juicy-j open the port on `tailscale0`, and VictoriaMetrics on juicy-j gets a
     `client=<client address>`, and on `client` as
     `nix_builds_offloaded{machine=…} 1`;
   - after running `nix-gc.service`, upkeep metrics are present;
+  - `nix_daemon_cgroup_cpu_seconds_total` increases across a build;
   - `nix_store_dead_paths` equals the count from `nix-store --gc --print-dead`
     run in the test (exact set comparison via a debug flag that dumps the dead
     set).
@@ -366,5 +385,11 @@ juicy-j open the port on `tailscale0`, and VictoriaMetrics on juicy-j gets a
 ## Phase 2 candidates
 
 - Event metrics from Determinate's JSON log socket or a `post-build-hook`.
+- Per-origin build CPU totals (`nix_builds_cpu_seconds_total{origin,client}`).
+  With `use-cgroups = true`, Nix reads each build cgroup's CPU time before
+  deleting it and returns it in the build result as `cpuUser`/`cpuSystem`,
+  but only to the client; nothing on the builder records it. First check:
+  does Determinate's JSON log carry those fields per build? If so, the counter
+  is exact and `use-cgroups` becomes a documented prerequisite.
 - determinate-nixd automatic GC runs.
 - Hydra metrics, upstream in Hydra.

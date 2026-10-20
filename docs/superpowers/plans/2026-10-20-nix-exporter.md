@@ -531,10 +531,6 @@ impl Paths {
     pub fn temproots(&self) -> PathBuf {
         self.state_dir.join("temproots")
     }
-
-    pub fn gcroots_auto(&self) -> PathBuf {
-        self.state_dir.join("gcroots/auto")
-    }
 }
 ```
 
@@ -4766,6 +4762,8 @@ pkgs.testers.runNixOSTest (
           wait_for(builder, lambda t: value(t, 'nix_upkeep_last_freed_bytes{unit="nix-optimise.service"}') is not None, "optimise freed bytes")
 
       with subtest("profiles and roots"):
+          # Test VMs boot without creating a system profile.
+          builder.succeed("nix-env -p /nix/var/nix/profiles/system --set /run/current-system")
           wait_for(builder, lambda t: (value(t, 'nix_profile_generations{profile="/nix/var/nix/profiles/system"}') or 0) >= 1, "system profile")
           wait_for(builder, lambda t: (value(t, 'nix_store_gc_roots{kind="profile"}') or 0) >= 1, "profile roots")
 

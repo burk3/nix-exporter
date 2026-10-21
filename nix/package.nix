@@ -1,4 +1,4 @@
-{ craneLib }:
+{ craneLib, lib }:
 let
   common = {
     src = craneLib.cleanCargoSource ../.;
@@ -13,6 +13,7 @@ craneLib.buildPackage (
     meta = {
       description = "Prometheus exporter for the Nix store and daemon";
       mainProgram = "nix-exporter";
+      license = lib.licenses.mit;
     };
   }
 )

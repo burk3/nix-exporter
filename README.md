@@ -16,10 +16,6 @@ of other users' processes.
 
 ```nix
 inputs.nix-exporter.url = "github:burk3/nix-exporter";
-# or from FlakeHub: tagged releases
-# inputs.nix-exporter.url = "https://flakehub.com/f/burk3/nix-exporter/0.1";
-# or the latest master build (published as 0.0.<commit count>)
-# inputs.nix-exporter.url = "https://flakehub.com/f/burk3/nix-exporter/0.0";
 
 # in a NixOS configuration
 imports = [ inputs.nix-exporter.nixosModules.default ];
@@ -268,11 +264,3 @@ nix develop
 cargo test
 nix build .#checks.x86_64-linux.vm
 ```
-
-CI runs the unit tests (the `package` check) on x86_64 and aarch64 for every
-push to `master` and every pull request; the NixOS tests run locally.
-
-Every push to `master` that passes CI is published to FlakeHub as a rolling
-version `0.0.<commit count>`. To publish a release, bump `version` in
-`Cargo.toml`, commit, and push a matching tag (`v0.1.0` for version `0.1.0`);
-the tag workflow refuses a tag that does not match `Cargo.toml`.

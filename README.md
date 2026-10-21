@@ -31,6 +31,17 @@ services.nix-exporter = {
 };
 ```
 
+Prebuilt packages for `x86_64-linux` and `aarch64-linux` are in a public binary cache:
+
+```nix
+nix.settings = {
+  extra-substituters = [ "https://burk3.cachix.org" ];
+  extra-trusted-public-keys = [ "burk3.cachix.org-1:lrEh0jbE0525QZA8hcH/Sx2EuZT6mWzm5qyV5PO6nbc=" ];
+};
+```
+
+The cache only has the package as this flake builds it, so leave out `inputs.nixpkgs.follows` for this input if you want to use it.
+
 Options under `services.nix-exporter`:
 
 | option | default | meaning |

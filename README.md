@@ -16,6 +16,10 @@ of other users' processes.
 
 ```nix
 inputs.nix-exporter.url = "github:burk3/nix-exporter";
+# or from FlakeHub: tagged releases
+# inputs.nix-exporter.url = "https://flakehub.com/f/burk3/nix-exporter/0.1";
+# or the latest master build (published as 0.0.<commit count>)
+# inputs.nix-exporter.url = "https://flakehub.com/f/burk3/nix-exporter/0.0";
 
 # in a NixOS configuration
 imports = [ inputs.nix-exporter.nixosModules.default ];

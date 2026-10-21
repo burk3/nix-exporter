@@ -69,7 +69,7 @@ families. Each one is isolated: its failure does not affect the others.
 | `daemon` | 15s | `/proc`, the daemon unit's cgroup v2 files |
 | `builds` | 15s | `/nix/var/nix/active-builds/`, `/proc`, `/proc/net/tcp{,6}`, reverse DNS |
 | `slots` | 15s | machines files, `/nix/var/nix/current-load/`, `/proc/locks` |
-| `builders` | 60s | `nix store info --store <uri>` per machine, with timeout |
+| `builders` | 300s (`--ping-interval`; `--no-ping-builders` disables) | `nix store info --store <uri>` per machine, with timeout |
 | `profiles` | 60s | GC roots list, profile symlinks, `db.sqlite` |
 | `upkeep` | 60s | `systemctl show`, `journalctl` |
 | `liveness` | 1h | `nix-store --gc --print-roots`, `db.sqlite` reachability walk |
@@ -80,7 +80,8 @@ Implementation stays small and synchronous: one OS thread per collector,
 `/sys/fs/cgroup` and the text exposition format are handled by small
 in-tree modules (each parser unit-tested), and systemd is queried with
 `systemctl show` / `journalctl` subprocesses rather than D-Bus. Base
-intervals scale from `--base-interval` (default 15s; 60s collectors use 4x)
+intervals scale from `--base-interval` (default 15s; 60s collectors use 4x;
+`builders` has its own `--ping-interval`)
 so the NixOS test can run them every 2s.
 
 All `nix` subprocesses run with `NIX_REMOTE=daemon`: under

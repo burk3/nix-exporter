@@ -93,8 +93,8 @@ impl Ctx {
     }
 }
 
-/// A Nix command that goes through the daemon (see the spec: under
-/// `ProtectSystem=strict` a root client cannot open the local store).
+/// A Nix command that goes through the daemon: under
+/// `ProtectSystem=strict` a root client cannot open the local store.
 pub fn nix_command(program: &str) -> Command {
     let mut c = Command::new(program);
     c.env("NIX_REMOTE", "daemon");

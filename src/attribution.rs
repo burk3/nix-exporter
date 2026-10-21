@@ -110,7 +110,7 @@ mod tests {
     const PASSWD: &str = "root:x:0:0::/:/x\nburke:x:1000:100::/:/x\nremotebuild:x:1001:100::/:/x\nhydra-queue-runner:x:2000:2000::/:/x\n";
     const TCP: &str = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n   0: 0EA57364:0016 37924A64:B354 01 00000000:00000000 02:000A3B2C 00000000     0        0 11035730 2 0000000000000000 20 4 30 10 -1\n";
 
-    /// The process chains seen on juicy-j with research/probe.sh.
+    /// The process chains seen on juicy-j.
     fn setup() -> (tempfile::TempDir, ProcTable, Users, TcpTable) {
         let d = tempfile::tempdir().unwrap();
         let p = d.path();

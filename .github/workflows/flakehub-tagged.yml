@@ -1,0 +1,38 @@
+name: Publish tags to FlakeHub
+
+on:
+  push:
+    tags:
+      - v?[0-9]+.[0-9]+.[0-9]+*
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: The existing tag to publish to FlakeHub
+        type: string
+        required: true
+
+jobs:
+  flakehub-publish:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # FlakeHub authenticates with the workflow's OIDC token
+      contents: read
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: refs/tags/${{ env.TAG }}
+      - name: Check the tag matches Cargo.toml
+        run: |
+          crate=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          if [ "${TAG#v}" != "$crate" ]; then
+            echo "tag $TAG does not match Cargo.toml version $crate" >&2
+            exit 1
+          fi
+      - uses: DeterminateSystems/determinate-nix-action@v3.23.3
+      - run: nix build -L .#checks.x86_64-linux.package
+      - uses: DeterminateSystems/flakehub-push@v7
+        with:
+          visibility: public
+          tag: ${{ env.TAG }}

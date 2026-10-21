@@ -25,3 +25,24 @@ jobs:
       - uses: DeterminateSystems/determinate-nix-action@v3.23.3
       # Builds the crate; crane runs `cargo test` in the build.
       - run: nix build -L .#checks.${{ matrix.system }}.package
+
+  flakehub-rolling:
+    name: Publish rolling version to FlakeHub
+    needs: unit-tests
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # FlakeHub authenticates with the workflow's OIDC token
+      contents: read
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0 # the rolling version counts commits
+      - uses: DeterminateSystems/determinate-nix-action@v3.23.3
+      - uses: DeterminateSystems/flakehub-push@v7
+        with:
+          visibility: public
+          rolling: true
+          # 0.0.<commit count>: tagged releases (v0.1.0 and up) always sort
+          # above master builds, so `…/0.1` only resolves to tags.
+          rolling-minor: 0

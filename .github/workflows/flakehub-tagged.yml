@@ -27,7 +27,6 @@ jobs:
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     permissions:
-      id-token: write # FlakeHub (Cache) authenticates with the workflow's OIDC token
       contents: read
     steps:
       - uses: actions/checkout@v7.0.1
@@ -41,7 +40,10 @@ jobs:
             exit 1
           fi
       - uses: DeterminateSystems/determinate-nix-action@v3.23.3
-      - uses: DeterminateSystems/flakehub-cache-action@v3.23.3
+      - uses: cachix/cachix-action@v17
+        with:
+          name: burk3
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
       - run: nix build -L .#checks.${{ matrix.system }}.package
 
   flakehub-publish:
@@ -60,4 +62,3 @@ jobs:
         with:
           visibility: public
           tag: ${{ env.TAG }}
-          include-output-paths: true

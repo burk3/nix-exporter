@@ -18,12 +18,16 @@ jobs:
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     permissions:
-      id-token: write
+      id-token: write # FlakeHub (Cache) authenticates with the workflow's OIDC token
       contents: read
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: DeterminateSystems/determinate-nix-action@v3.23.3
-      # Builds the crate; crane runs `cargo test` in the build.
+      # Uploads everything built in this job to FlakeHub Cache; master only.
+      - if: github.event_name == 'push'
+        uses: DeterminateSystems/flakehub-cache-action@v3.23.3
+      # Builds the crate (the same derivation as packages.default); crane runs
+      # `cargo test` in the build.
       - run: nix build -L .#checks.${{ matrix.system }}.package
 
   flakehub-rolling:
@@ -46,3 +50,4 @@ jobs:
           # 0.0.<commit count>: tagged releases (v0.1.0 and up) always sort
           # above master builds, so `…/0.1` only resolves to tags.
           rolling-minor: 0
+          include-output-paths: true

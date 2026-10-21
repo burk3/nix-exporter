@@ -11,14 +11,24 @@ on:
         type: string
         required: true
 
+env:
+  TAG: ${{ inputs.tag || github.ref_name }}
+
 jobs:
-  flakehub-publish:
-    runs-on: ubuntu-latest
+  build:
+    name: Build and cache (${{ matrix.system }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - system: x86_64-linux
+            runner: ubuntu-latest
+          - system: aarch64-linux
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     permissions:
-      id-token: write # FlakeHub authenticates with the workflow's OIDC token
+      id-token: write # FlakeHub (Cache) authenticates with the workflow's OIDC token
       contents: read
-    env:
-      TAG: ${{ inputs.tag || github.ref_name }}
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -31,8 +41,23 @@ jobs:
             exit 1
           fi
       - uses: DeterminateSystems/determinate-nix-action@v3.23.3
-      - run: nix build -L .#checks.x86_64-linux.package
+      - uses: DeterminateSystems/flakehub-cache-action@v3.23.3
+      - run: nix build -L .#checks.${{ matrix.system }}.package
+
+  flakehub-publish:
+    name: Publish to FlakeHub
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: refs/tags/${{ env.TAG }}
+      - uses: DeterminateSystems/determinate-nix-action@v3.23.3
       - uses: DeterminateSystems/flakehub-push@v7
         with:
           visibility: public
           tag: ${{ env.TAG }}
+          include-output-paths: true
